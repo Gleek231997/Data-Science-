@@ -1,0 +1,354 @@
+---
+title: "Final Project"
+author: "Glory Ekbote"
+date: "2025-04-21"
+output: html_document
+---
+
+```{r}
+#Data Setup and Exploration
+# Load packages
+library(tidyverse)
+library(tableone)
+
+# Read the data
+data <- read.csv("/Users/gloryekbote/Desktop/Stat_mod Project/data.csv")
+
+# Glimpse at data structure
+glimpse(data)
+
+# Convert relevant columns to factors
+data <- data %>%
+  mutate(
+    z = as.factor(z),
+    race = as.factor(race),
+    gender = as.factor(gender),
+    fgen = as.factor(fgen),
+    urban = as.factor(urban),
+    schoolid = as.factor(schoolid)
+  )
+
+# Basic summary of treatment vs control
+table(data$z)
+
+# Create Table 1: Covariate summary by treatment
+vars <- c("selfrpt", "race", "gender", "fgen", "urban", "mindset", "test", "sch_race", "pov", "size")
+table1 <- CreateTableOne(vars = vars, strata = "z", data = data, factorVars = c("race", "gender", "fgen", "urban"))
+print(table1, showAllLevels = TRUE)
+```
+
+```{r}
+#Estimate and Diagnose the Propensity Score
+# Load necessary packages
+library(MatchIt)
+library(ggplot2)
+
+# Propensity score model using logistic regression
+ps_model <- glm(z ~ selfrpt + race + gender + fgen + urban + mindset + test + sch_race + pov + size,
+                data = data, family = binomial())
+
+# Add predicted propensity scores to the dataset
+data$pscore <- predict(ps_model, type = "response")
+
+# Visualize propensity score distribution
+ggplot(data, aes(x = pscore, fill = z)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  labs(title = "Propensity Score Distribution", x = "Propensity Score", fill = "Treatment") +
+  theme_minimal()
+
+# Save
+ggsave("propensity_plot.png", width = 10, height = 6)
+```
+
+```{r }
+#Estimate ATE using IPW
+# IPW weights
+data <- data %>%
+  mutate(
+    weight_ipw = ifelse(z == 1, 1 / pscore, 1 / (1 - pscore))
+  )
+
+# Estimate weighted means for treatment and control
+ate_ipw <- with(data, mean(y[z == 1] * weight_ipw[z == 1]) - 
+                      mean(y[z == 0] * weight_ipw[z == 0]))
+
+# Print ATE
+cat("Estimated ATE using IPW:", round(ate_ipw, 4), "\n")
+
+#Confidence Interval using Bootstrap
+# Function to compute IPW ATE for bootstrapping
+get_ipw_ate <- function(data) {
+  with(data, mean(y[z == 1] * weight_ipw[z == 1]) - 
+             mean(y[z == 0] * weight_ipw[z == 0]))
+}
+
+# Bootstrap
+set.seed(123)
+B <- 1000
+boot_ates <- replicate(B, {
+  sampled_data <- data[sample(1:nrow(data), replace = TRUE), ]
+  get_ipw_ate(sampled_data)
+})
+
+# CI
+ci_ipw <- quantile(boot_ates, c(0.025, 0.975))
+cat("95% Bootstrap CI for ATE (IPW): [", round(ci_ipw[1], 4), ",", round(ci_ipw[2], 4), "]\n")
+```
+
+```{r}
+#Estimate ATE using Augmented Inverse Probability Weighting (AIPW)
+#install.packages("SuperLearner")  # Optional: for flexible outcome modeling
+# STEP 1: Outcome models (predict Y for treatment and control separately)
+outcome_model_treat <- lm(y ~ selfrpt + race + gender + fgen + urban + mindset + test + sch_race + pov + size, 
+                          data = data[data$z == 1, ])
+outcome_model_control <- lm(y ~ selfrpt + race + gender + fgen + urban + mindset + test + sch_race + pov + size, 
+                            data = data[data$z == 0, ])
+
+# STEP 2: Predict counterfactual outcomes for all students
+data$mu1_hat <- predict(outcome_model_treat, newdata = data)
+data$mu0_hat <- predict(outcome_model_control, newdata = data)
+
+# ✅ FIX: Convert z (factor) to numeric for arithmetic
+data$z_num <- as.numeric(as.character(data$z))  # Converts factor to 0/1
+
+# STEP 3: Compute AIPW terms
+data <- data %>%
+  mutate(
+    aipw_term1 = mu1_hat + (z_num * (y - mu1_hat)) / pscore,
+    aipw_term0 = mu0_hat + ((1 - z_num) * (y - mu0_hat)) / (1 - pscore),
+    aipw_ate = aipw_term1 - aipw_term0
+  )
+
+# STEP 4: Final ATE estimate
+ate_aipw <- mean(data$aipw_ate)
+cat("Estimated ATE using AIPW:", round(ate_aipw, 4), "\n")
+```
+```{r}
+# --- Bootstrap for IPW ATE with trimmed pscore to avoid NaN ---
+
+# Function to compute IPW ATE on a sample
+get_boot_ipw_ate <- function(sample_data) {
+  # Re-fit propensity score model on bootstrap sample
+  ps_model <- glm(z ~ selfrpt + race + gender + fgen + urban + mindset + test + sch_race + pov + size,
+                  data = sample_data, family = binomial())
+  sample_data$pscore <- predict(ps_model, type = "response")
+  sample_data$pscore <- pmin(pmax(sample_data$pscore, 0.01), 0.99)  # trim for stability
+  
+  # Recalculate IPW weights
+  sample_data$weight_ipw <- ifelse(sample_data$z == 1,
+                                   1 / sample_data$pscore,
+                                   1 / (1 - sample_data$pscore))
+  
+  # Compute weighted mean difference (ATE)
+  mean(sample_data$y[sample_data$z == 1] * sample_data$weight_ipw[sample_data$z == 1]) -
+    mean(sample_data$y[sample_data$z == 0] * sample_data$weight_ipw[sample_data$z == 0])
+}
+
+# Run the bootstrap
+set.seed(123)
+n_boot <- 1000
+boot_ipw_ates <- replicate(n_boot, {
+  idx <- sample(1:nrow(data), replace = TRUE)
+  tryCatch(get_boot_ipw_ate(data[idx, ]), error = function(e) NA)
+})
+
+# Clean up NA results
+boot_ipw_ates <- boot_ipw_ates[!is.na(boot_ipw_ates)]
+
+# Compute confidence interval and summary stats
+ipw_ci <- quantile(boot_ipw_ates, probs = c(0.025, 0.975))
+ipw_se <- sd(boot_ipw_ates)
+ipw_mean <- mean(boot_ipw_ates)
+
+# Output
+cat("📊 IPW Bootstrap Summary\n")
+cat("Mean ATE:", round(ipw_mean, 4), "\n")
+cat("Standard Error:", round(ipw_se, 4), "\n")
+cat("95% CI:", round(ipw_ci[1], 4), "-", round(ipw_ci[2], 4), "\n")
+
+```
+```{r}
+# --- Plot Bootstrap Distribution of IPW ATE ---
+
+library(ggplot2)
+
+# Convert to tibble
+df_ipw_boot <- tibble(ATE = boot_ipw_ates)
+
+# Plot
+ggplot(df_ipw_boot, aes(x = ATE)) +
+  geom_density(fill = "skyblue", alpha = 0.6) +
+  geom_vline(xintercept = ipw_mean, linetype = "dashed", color = "blue") +
+  geom_vline(xintercept = ipw_ci, linetype = "dotted", color = "red") +
+  labs(
+    title = "Bootstrap Distribution of ATE (IPW)",
+    x = "Estimated ATE",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+```{r}
+# --- Function to compute AIPW ATE on a bootstrap sample ---
+get_boot_aipw_ate <- function(sample_data) {
+  # Step 1: Estimate Propensity Scores
+  ps_model <- glm(z ~ selfrpt + race + gender + fgen + urban + mindset + test + sch_race + pov + size,
+                  data = sample_data, family = binomial())
+  sample_data$pscore <- predict(ps_model, type = "response")
+  sample_data$pscore <- pmin(pmax(sample_data$pscore, 0.01), 0.99)  # trim
+
+  # Step 2: Outcome Models
+  mu1_model <- lm(y ~ selfrpt + race + gender + fgen + urban + mindset +
+                    test + sch_race + pov + size,
+                  data = sample_data[sample_data$z == 1, ])
+  mu0_model <- lm(y ~ selfrpt + race + gender + fgen + urban + mindset +
+                    test + sch_race + pov + size,
+                  data = sample_data[sample_data$z == 0, ])
+
+  # Step 3: Predict Counterfactuals
+  sample_data$mu1_hat <- predict(mu1_model, newdata = sample_data)
+  sample_data$mu0_hat <- predict(mu0_model, newdata = sample_data)
+
+  z_num <- as.numeric(as.character(sample_data$z))
+
+  # Step 4: Compute AIPW estimate
+  aipw1 <- sample_data$mu1_hat + (z_num * (sample_data$y - sample_data$mu1_hat)) / sample_data$pscore
+  aipw0 <- sample_data$mu0_hat + ((1 - z_num) * (sample_data$y - sample_data$mu0_hat)) / (1 - sample_data$pscore)
+  return(mean(aipw1 - aipw0))
+}
+
+# --- Bootstrap Sampling ---
+set.seed(123)
+n_boot <- 1000
+boot_aipw_ates <- replicate(n_boot, {
+  idx <- sample(1:nrow(data), replace = TRUE)
+  tryCatch(get_boot_aipw_ate(data[idx, ]), error = function(e) NA)
+})
+
+# Clean NAs
+boot_aipw_ates <- boot_aipw_ates[!is.na(boot_aipw_ates)]
+
+# Summary stats
+aipw_ci <- quantile(boot_aipw_ates, probs = c(0.025, 0.975))
+aipw_se <- sd(boot_aipw_ates)
+aipw_mean <- mean(boot_aipw_ates)
+
+# Print results
+cat("📊 AIPW Bootstrap Summary\n")
+cat("Mean ATE:", round(aipw_mean, 4), "\n")
+cat("Standard Error:", round(aipw_se, 4), "\n")
+cat("95% CI:", round(aipw_ci[1], 4), "-", round(aipw_ci[2], 4), "\n")
+
+```
+```{r}
+#Bootstrap Distribution of ATE (AIPW
+df_aipw_boot <- tibble(ATE = boot_aipw_ates)
+
+ggplot(df_aipw_boot, aes(x = ATE)) +
+  geom_density(fill = "lightgreen", alpha = 0.6) +
+  geom_vline(xintercept = aipw_mean, linetype = "dashed", color = "darkgreen") +
+  geom_vline(xintercept = aipw_ci, linetype = "dotted", color = "red") +
+  labs(
+    title = "Bootstrap Distribution of ATE (AIPW)",
+    x = "Estimated ATE",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Love Plot (Covariate Balance Before vs After Weighting)
+install.packages("cobalt")
+library(cobalt)
+
+# Generate Love Plot
+love.plot(bal.tab(z ~ selfrpt + race + gender + fgen + urban + mindset + test + sch_race + pov + size, 
+                  data = data, weights = data$weight_ipw, method = "weighting"),
+          threshold = 0.1,
+          var.order = "unadjusted", abs = TRUE,
+          title = "Covariate Balance Before and After IPW")
+
+# Save
+ggsave("love_plot.png", width = 10, height = 6)
+
+```
+
+```{r}
+#ATE Estimation Table / Bar Plot (Optional but Great for Poster)
+library(ggplot2)
+
+# Plot ATE estimates
+ggplot(results_summary, aes(x = Method, y = ATE_Estimate, fill = Method)) +
+  geom_col(width = 0.5) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), width = 0.2, na.rm = TRUE) +
+  labs(title = "Average Treatment Effect (ATE) Estimates",
+       y = "Estimated ATE", x = "Method") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Save
+ggsave("ate_estimates_plot.png", width = 8, height = 6)
+```
+
+```{r}
+ggplot(data, aes(x = y, fill = z)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Distribution of Achievement Scores by Treatment Group",
+       x = "Outcome Y", fill = "Treatment") +
+  theme_minimal()
+
+ggsave("outcome_distribution_plot.png", width = 10, height = 6)
+```
+
+```{r}
+# --- Hajek Estimator Function ---
+get_boot_hajek_ate <- function(sample_data) {
+  ps_model <- glm(z ~ selfrpt + race + gender + fgen + urban + mindset + test + sch_race + pov + size,
+                  data = sample_data, family = binomial())
+  sample_data$pscore <- predict(ps_model, type = "response")
+  sample_data$pscore <- pmin(pmax(sample_data$pscore, 0.01), 0.99)
+
+  sample_data <- sample_data %>%
+    mutate(weight_hajek = ifelse(z == 1, 1 / pscore, 1 / (1 - pscore)))
+
+  num_treated <- sum(sample_data$weight_hajek[sample_data$z == 1] * sample_data$y[sample_data$z == 1])
+  denom_treated <- sum(sample_data$weight_hajek[sample_data$z == 1])
+
+  num_control <- sum(sample_data$weight_hajek[sample_data$z == 0] * sample_data$y[sample_data$z == 0])
+  denom_control <- sum(sample_data$weight_hajek[sample_data$z == 0])
+
+  return((num_treated / denom_treated) - (num_control / denom_control))
+}
+
+# --- Bootstrap Hajek ---
+set.seed(123)
+n_boot <- 1000
+boot_hajek_ates <- replicate(n_boot, {
+  idx <- sample(1:nrow(data), replace = TRUE)
+  tryCatch(get_boot_hajek_ate(data[idx, ]), error = function(e) NA)
+})
+
+# Clean and summarize
+boot_hajek_ates <- boot_hajek_ates[!is.na(boot_hajek_ates)]
+hajek_ci <- quantile(boot_hajek_ates, probs = c(0.025, 0.975))
+hajek_mean <- mean(boot_hajek_ates)
+
+# --- Plot ---
+df_hajek_boot <- tibble(ATE = boot_hajek_ates)
+
+p_hajek <- ggplot(df_hajek_boot, aes(x = ATE)) +
+  geom_density(fill = "orange", alpha = 0.6) +
+  geom_vline(xintercept = hajek_mean, linetype = "dashed", color = "orange4") +
+  geom_vline(xintercept = hajek_ci, linetype = "dotted", color = "red") +
+  labs(title = "Bootstrap Distribution of ATE (Hajek Estimator)",
+       x = "Estimated ATE", y = "Density") +
+  theme_minimal()
+
+# Display or combine with others using patchwork
+library(patchwork)
+(p_ipw | p_aipw) / p_hajek  # layout: IPW & AIPW side-by-side, Hajek below
+
+# Save if desired
+ggsave("bootstrap_hajek_ate_distribution.png", p_hajek, width = 10, height = 6)
+
+```
