@@ -1,2 +1,2 @@
-# Data-Science
+# CAUSAL INFERENCE
 creating Data Science projects
